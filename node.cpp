@@ -20,7 +20,10 @@ struct PeerInfo {
 class Node
 {
     public:
-        Node(int id, int port, const vector<PeerInfo>& peers) : id(id), port(port) {
+        Node(int id, int port, const vector<PeerInfo>& peers, bool active) : id(id), port(port) {
+            // set state
+            state.store(active);
+
 
             for (const auto& p : peers)
                 if (p.id != id) expected_peers++;
@@ -83,6 +86,24 @@ class Node
                 }
                 for (auto& t : to_join) if (t.joinable()) t.join();
             }
+        }
+
+        bool send_to(int peer_id, int value) {
+            int fd;
+            {
+                lock_guard<mutex> lk(peers_mtx);
+                auto it = peer_channels.find(peer_id);
+                if (it == peer_channels.end()) return false;   // not connected
+                fd = it->second;
+            }
+            int32_t net = htonl(value);
+            return send_all(fd, &net, sizeof(net));
+        }
+
+        void wait_for_all_peers() {
+            unique_lock<mutex> lk(peers_mtx);
+            peers_cv.wait(lk, [&] { return peer_channels.size() == expected_peers; });
+            cout << "Node " << id << ": all peers connected" << endl;
         }
 
         // ONE of these, started in the constructor
@@ -159,11 +180,23 @@ class Node
             thread_store.push_back(std::move(t));    // move, don't copy
         }
 
+        bool get_running()
+        {
+            bool t = running.load();
+            return t;
+        }
+
+        bool get_state()
+        {
+            bool s = state.load();
+            return s;
+        }
+
 
     private:
         int id, port, listen_fd;
         atomic<bool> running{true};
-
+        atomic<bool> state;
         mutex threads_mtx;
         vector<thread> thread_store;
 
@@ -206,7 +239,7 @@ int main(int argc, char* argv[]) {
     vector<PeerInfo> peers = read_config("config.txt");
 
     int my_port = /* look up my_id in peers */;
-    Node node(my_id, my_port, peers);
+    Node node(my_id, my_port, peers, false);
 
     node.wait_for_all_peers();     // blocks until every channel exists
 
@@ -217,4 +250,26 @@ int main(int argc, char* argv[]) {
 
     // Keep main alive while reader threads handle incoming messages
     // e.g. wait for a done condition, or sleep/loop
+
+
+
+    bool active = false;
+    bool running = true;
+
+    while (node.get_running())
+    {
+        if(node.get_state() == true)
+        {
+            // choose random Node
+            // cnoose Number of Messages 
+            // send message
+            // turn passive
+        }
+
+        if (node.get_state() == false) // if it's passive 
+        {
+            //sleep
+            // nothing is done here ,because only reader threads will change it to active
+        }
+    }
 }
