@@ -114,7 +114,7 @@ class Node
                     close(fd);
                     return;
                 }
-
+                // once handshake is complete register the peer to another thread
                 cout << "Node " << id << ": connected to node " << peer_id << endl;
 
                 // 3. Save the channel
@@ -198,6 +198,7 @@ int main(int argc, char* argv[])
     // ./program portNumber $1 8080 cs1.utdallas.edu.12 0$2 
     // portNumber will be port it sends
     
+    // make peerInfo struct, and send that in constrictor
     if (argc < 2)
     {
         cerr << "Usage: " << argv[0] << " <portNumber> <listNodes>" << endl;
@@ -207,18 +208,7 @@ int main(int argc, char* argv[])
     int portNumber = stoi(argv[1]);
     string listNodes = argv[2];
 
-    
-    
-
-    // If success we can create a node instance
-    Node item(portNumber);
-    // item.spawn_server_socket(0, portNumber, "localhost"); // Example of spawning a server socket for the local node
-    // item.spawn_client_socket(0, portNumber, "localhost"); // Example of spawning a client socket for the local node
-
-    // Initialize node w PortNumber, if port is taken exit 1. Otherwise print started
-
-    // split listNodes delim '$', then split that on whitespace
-    vector<string> node_entries;
+   
     size_t pos = 0;
     string token;
     while ((pos = listNodes.find('$')) != string::npos) {
@@ -233,28 +223,6 @@ int main(int argc, char* argv[])
     }
 
 
-    for (const auto& entry : node_entries) {
-        istringstream iss(entry);
-        string node, port, host, send_receive;
-        if (!(iss >> node >> port >> host >> send_receive)) {
-            cerr << "Invalid node entry: " << entry << endl;
-            continue;
-        }
-        // Process each node entry as needed
-        int nodeNum = stoi(node);
-        int nodePort = stoi(port);
-        string nodeHost = host;
-        bool send = (send_receive == "Send");
-        bool receive = (send_receive == "Receive");
-        if (send) {
-            // Logic for sending to this node
-            // temp name item (make later)
-            item.spawn_client_socket(nodeNum, nodePort, nodeHost);
-
-        } else if (receive) {
-            // Logic for receiving from this node
-            item.spawn_server_socket(nodeNum, nodePort, nodeHost);
-        }
     }
 
     return 0;
