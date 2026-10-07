@@ -4,6 +4,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+
+
+// the main argument
+
+
 int main()
 {
     // creating socket
