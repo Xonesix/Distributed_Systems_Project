@@ -8,6 +8,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <atomic>
+#include <condition_variable>
 using namespace std;
 
 struct PeerInfo {
@@ -21,9 +22,14 @@ class Node
     public:
         Node(int id, int port, const vector<PeerInfo>& peers) : id(id), port(port) {
 
+            for (const auto& p : peers)
+                if (p.id != id) expected_peers++;
+
             // 1. Create the listening socket
             listen_fd = socket(AF_INET, SOCK_STREAM, 0);
             if (listen_fd < 0) { perror("socket"); exit(1); }
+
+
 
             // 2. Allow quick restarts (avoids "address already in use")
             int opt = 1;
@@ -142,8 +148,10 @@ class Node
             peer_channels.erase(peer_id);
         }
         void register_peer(int peer_id, int fd) {
-            lock_guard<mutex> lk(peers_mtx);
+            unique_lock<mutex> lk(peers_mtx);
             peer_channels[peer_id] = fd;
+            lk.unlock();
+            peers_cv.notify_all();
         }
         void add_thread(thread t)                    // take by value
         {
@@ -161,6 +169,9 @@ class Node
 
         mutex peers_mtx;
         unordered_map<int, int> peer_channels;   // node id -> fd
+
+        condition_variable peers_cv;
+        size_t expected_peers;
         
         
         static bool recv_all(int fd, void* data, size_t len) {
@@ -189,42 +200,21 @@ class Node
 
 
 
-// This main will have args for how many server ports to listen (and which to listen), and which client to connect to (and the ports of them)
-// This will initialize a thread for each port
-int main(int argc, char* argv[])
-{
-    // args will be split for 
-    // listNodes $Node Port Host Receive/Send$Node Port Host...$ ... $
-    // ./program portNumber $1 8080 cs1.utdallas.edu.12 0$2 
-    // portNumber will be port it sends
-    
-    // make peerInfo struct, and send that in constrictor
-    if (argc < 2)
-    {
-        cerr << "Usage: " << argv[0] << " <portNumber> <listNodes>" << endl;
-        return 1;
+
+int main(int argc, char* argv[]) {
+    int my_id = stoi(argv[1]);
+    vector<PeerInfo> peers = read_config("config.txt");
+
+    int my_port = /* look up my_id in peers */;
+    Node node(my_id, my_port, peers);
+
+    node.wait_for_all_peers();     // blocks until every channel exists
+
+    // Now send first
+    for (const auto& p : peers) {
+        if (p.id != my_id) node.send_to(p.id, 42);
     }
 
-    int portNumber = stoi(argv[1]);
-    string listNodes = argv[2];
-
-   
-    size_t pos = 0;
-    string token;
-    while ((pos = listNodes.find('$')) != string::npos) {
-        token = listNodes.substr(0, pos);
-        if (!token.empty()) {
-            node_entries.push_back(token);
-        }
-        listNodes.erase(0, pos + 1);
-    }
-    if (!listNodes.empty()) {
-        node_entries.push_back(listNodes);
-    }
-
-
-    }
-
-    return 0;
-    
+    // Keep main alive while reader threads handle incoming messages
+    // e.g. wait for a done condition, or sleep/loop
 }
