@@ -1,0 +1,11 @@
+# comment "IGNORE THIS"
+numberofNodes minPerActive maxPerActive minSendDelay snapShotDelay maxNumber
+
+node hostName portNumber
+node1 hostName portNumber
+
+# if blank line or comment IGNORE
+
+1 4 # neighbors for node 0 
+0 2 3 # neighbors for node 1
+1 3 # neighbors for node 2
