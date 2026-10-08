@@ -164,4 +164,22 @@ int main()
         }
         cout << endl << endl;
     }
+
+    // Here is future work | spawn binaries | ssh into eachHost, execute binary w neighbor list
+
+
+    // Right now -> 
+    /*
+        for peer
+            ssh into machine
+                transfer binary
+                exec with args
+                ./binary nodeId portNum maxNumMsg minSendMsg \ 
+                 $n1 host port$n2 host port$ni host port$...$nk host port$
+    
+    */
+   // The binary should handle the rest, connecting to socket
+   // We need to work on sockets across machines
+
+
 }
