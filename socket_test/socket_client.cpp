@@ -1,35 +1,47 @@
 #include <cstring>
 #include <iostream>
-#include <netinet/in.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+int main(int argc, char* argv[]) {
+    if (argc != 3) {
+        std::cerr << "Usage: " << argv[0] << " <host> <port>\n";
+        return 1;
+    }
 
+    // Look up the server's address from its hostname
+    addrinfo hints{}, *res;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    int err = getaddrinfo(argv[1], argv[2], &hints, &res);
+    if (err != 0) {
+        std::cerr << "getaddrinfo: " << gai_strerror(err) << '\n';
+        return 1;
+    }
 
-// the main argument
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) {
+        perror("socket");
+        freeaddrinfo(res);
+        return 1;
+    }
 
+    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+        perror("connect");
+        freeaddrinfo(res);
+        close(sock);
+        return 1;
+    }
+    freeaddrinfo(res);
 
-int main()
-{
-    // creating socket
-    int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
-
-    // specifying address
-    sockaddr_in serverAddress;
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(8080);
-    serverAddress.sin_addr.s_addr = INADDR_ANY;
-
-    // sending connection request
-    connect(clientSocket, (struct sockaddr*)&serverAddress,
-            sizeof(serverAddress));
-
-    // sending data
     const char* message = "Hello, server!";
-    send(clientSocket, message, strlen(message), 0);
+    if (send(sock, message, strlen(message), 0) < 0) {
+        perror("send");
+        close(sock);
+        return 1;
+    }
 
-    // closing socket
-    close(clientSocket);
-
+    close(sock);
     return 0;
 }

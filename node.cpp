@@ -1,6 +1,8 @@
 #include <cstring>
 #include <iostream>
 #include <netinet/in.h>
+#include <netdb.h>
+#include <chrono>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
@@ -131,7 +133,7 @@ class Node
         unordered_map<int, int> peer_channels;   // node id -> fd
 
         condition_variable peers_cv;
-        size_t expected_peers;
+        size_t expected_peers = 0;
         
         
         static bool recv_all(int fd, void* data, size_t len) {
@@ -155,6 +157,37 @@ class Node
             }
             return true;
     }
+
+        // Resolve host by name and open a TCP connection (same steps as socket_client.cpp).
+        // Returns the connected fd, or -1 if it failed (caller retries).
+        static int connect_to_host(const string& host, int peer_port) {
+            addrinfo hints{}, *res;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            string port_str = to_string(peer_port);
+            int err = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res);
+            if (err != 0) {
+                cerr << "getaddrinfo(" << host << "): " << gai_strerror(err) << endl;
+                return -1;
+            }
+
+            int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+            if (fd < 0) {
+                perror("socket");
+                freeaddrinfo(res);
+                return -1;
+            }
+
+            // No perror here: refused is expected while the peer isn't up yet
+            if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+                freeaddrinfo(res);
+                close(fd);
+                return -1;
+            }
+            freeaddrinfo(res);
+            return fd;
+        }
+
     // ONE of these, started in the constructor
         void accept_loop() {
             while (running) {
@@ -235,13 +268,16 @@ class Node
 
 };
 
-
+vector<PeerInfo> read_config(string s)
+{
+    
+}
 
 
 int main(int argc, char* argv[]) {
     // args NodeNumber Port Number maxNumMessages minSendMessages $n1 host port$n2 host port$ni host port$...$nk host port$
     int my_id = stoi(argv[1]);
-    vector<PeerInfo> peers = read_config("config.txt");
+    vector<PeerInfo> peers = read_config(argv[4]);
 
     int my_port = stoi(argv[2]);
     Node node(my_id, my_port, peers, false);

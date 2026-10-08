@@ -172,9 +172,9 @@ int main()
     /*
         for peer
             ssh into machine
-                transfer binary
+                transfer binary (DONT NEED CAUSE WE'LL BE ON NETWORK DRIVE | ALL BINARIES WILL BE ALREADY BUILT)
                 exec with args
-                ./binary nodeId portNum maxNumMsg minSendMsg \ 
+                ./binary nodeId portNum maxNumMsg minSendMsg activeOrPassive (chosenAtRandom) \ 
                  $n1 host port$n2 host port$ni host port$...$nk host port$
     
     */
