@@ -5,9 +5,18 @@
 #include <sstream>
 #include <vector>
 #include <unordered_map>
-
 // ssh each machine and start node
+#include <random>
+#include <cstdlib>
+#include <cstdio>
+#include <unistd.h>
+#include <sys/wait.h>
+
 using namespace std;
+
+// Binary is already built on the shared network drive; '~' expands on the remote side
+const string REMOTE_BINARY = "~/socket_project/binary";
+const string SSH_KEY_FILE = "/.ssh/id_rsa";   // relative to $HOME
 
 class PeerInfo {
     int id;
@@ -127,11 +136,47 @@ bool read_config_file(string fileName)
     return true;
 }
 
+// Builds the command run on the remote machine:
+// binary nodeId port minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active [neighborId host port]...
+string build_node_command(const PeerInfo& peer, bool active)
+{
+    ostringstream cmd;
+    cmd << REMOTE_BINARY << " " << peer.getId() << " " << peer.getPort()
+        << " " << minPerActive << " " << maxPerActive << " " << minSendDelay
+        << " " << snapShotDelay << " " << maxNumber << " " << (active ? 1 : 0);
 
-int main()
+    for (int n : neighbors[peer.getId()]) {
+        const PeerInfo& nb = peers.at(n);
+        cmd << " " << nb.getId() << " " << nb.getHost() << " " << nb.getPort();
+    }
+    return cmd.str();
+}
+
+// Starts "ssh host command" as a child process. Returns its pid, or -1 on failure.
+pid_t launch_over_ssh(const string& host, const string& command, const string& keyPath)
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return -1;
+    }
+    if (pid == 0) {
+        // -n: don't read stdin (otherwise all the ssh children fight over the terminal)
+        // BatchMode: fail instead of hanging on a password prompt if the key doesn't work
+        execlp("ssh", "ssh", "-n", "-i", keyPath.c_str(),
+               "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+               host.c_str(), command.c_str(), (char*)nullptr);
+        perror("execlp ssh");   // only reached if exec failed
+        _exit(127);
+    }
+    return pid;
+}
+
+
+int main(int argc, char* argv[])
 {
     // read config file
-    string fileName = "config.txt";
+    string fileName = (argc > 1) ? argv[1] : "config.txt";
     bool t = read_config_file(fileName);
     if(!t) {
         cerr << "failure reading" << endl;
@@ -165,21 +210,41 @@ int main()
         cout << endl << endl;
     }
 
-    // Here is future work | spawn binaries | ssh into eachHost, execute binary w neighbor list
+    // Pick one node at random to start active, the rest start passive
+    random_device rd;
+    mt19937 gen(rd());
+    uniform_int_distribution<int> pick(0, numberOfNodes - 1);
+    int activeNode = pick(gen);
+    cout << "Node " << activeNode << " starts active" << endl << endl;
 
+    const char* home = getenv("HOME");
+    if (!home) {
+        cerr << "HOME is not set, can't find ssh key" << endl;
+        return 1;
+    }
+    string keyPath = string(home) + SSH_KEY_FILE;
 
-    // Right now -> 
-    /*
-        for peer
-            ssh into machine
-                transfer binary (DONT NEED CAUSE WE'LL BE ON NETWORK DRIVE | ALL BINARIES WILL BE ALREADY BUILT)
-                exec with args
-                ./binary nodeId portNum maxNumMsg minSendMsg activeOrPassive (chosenAtRandom) \ 
-                 $n1 host port$n2 host port$ni host port$...$nk host port$
-    
-    */
-   // The binary should handle the rest, connecting to socket
-   // We need to work on sockets across machines
+    // ssh into each machine and start its node (binary is already on the network drive)
+    vector<pid_t> children;
+    for (int i = 0; i < numberOfNodes; i++) {
+        const PeerInfo& peer = peers.at(i);
+        string command = build_node_command(peer, i == activeNode);
+        cout << "Launching on " << peer.getHost() << ": " << command << endl;
 
+        pid_t pid = launch_over_ssh(peer.getHost(), command, keyPath);
+        if (pid > 0) children.push_back(pid);
+    }
 
+    // The binaries handle the rest (connecting sockets); wait for every ssh session to end
+    int failures = 0;
+    for (pid_t pid : children) {
+        int status;
+        waitpid(pid, &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) failures++;
+    }
+    if (failures > 0) {
+        cerr << failures << " node(s) exited with an error" << endl;
+        return 1;
+    }
+    return 0;
 }

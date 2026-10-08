@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <atomic>
 #include <condition_variable>
+#include <fstream>
 using namespace std;
 
 struct PeerInfo {
@@ -22,7 +23,12 @@ struct PeerInfo {
 class Node
 {
     public:
-        Node(int id, int port, const vector<PeerInfo>& peers, bool active) : id(id), port(port) {
+        // peers = this node's neighbors only
+        Node(int id, int port, const vector<PeerInfo>& peers, bool active,
+             int minPerActive, int maxPerActive, int minSendDelay, int snapShotDelay, int maxNumber)
+            : id(id), port(port),
+              minPerActive(minPerActive), maxPerActive(maxPerActive), minSendDelay(minSendDelay),
+              snapShotDelay(snapShotDelay), maxNumber(maxNumber) {
             // set state
             state.store(active);
 
@@ -103,10 +109,12 @@ class Node
             return send_all(fd, &net, sizeof(net));
         }
 
-        void wait_for_all_peers() {
+        // Blocks until every channel exists or the deadline passes. Returns false on timeout.
+        bool wait_for_all_peers(chrono::steady_clock::time_point deadline) {
             unique_lock<mutex> lk(peers_mtx);
-            peers_cv.wait(lk, [&] { return peer_channels.size() == expected_peers; });
-            cout << "Node " << id << ": all peers connected" << endl;
+            bool ok = peers_cv.wait_until(lk, deadline, [&] { return peer_channels.size() == expected_peers; });
+            if (ok) cout << "Node " << id << ": all peers connected" << endl;
+            return ok;
         }
 
         bool get_running()
@@ -124,6 +132,13 @@ class Node
 
     private:
         int id, port, listen_fd;
+
+        // Global parameters from the config file (logic to be added later)
+        int minPerActive;
+        int maxPerActive;
+        int minSendDelay;
+        int snapShotDelay;
+        int maxNumber;
         atomic<bool> running{true};
         atomic<bool> state;
         mutex threads_mtx;
@@ -268,21 +283,55 @@ class Node
 
 };
 
-vector<PeerInfo> read_config(string s)
-{
-    
-}
-
-
 int main(int argc, char* argv[]) {
-    // args NodeNumber Port Number maxNumMessages minSendMessages $n1 host port$n2 host port$ni host port$...$nk host port$
-    int my_id = stoi(argv[1]);
-    vector<PeerInfo> peers = read_config(argv[4]);
+    // args: nodeId port minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active(1/0)
+    //       followed by one "neighborId host port" triple per neighbor
+    const int FIXED_ARGS = 9;   // program name + 8 values
+    if (argc < FIXED_ARGS || (argc - FIXED_ARGS) % 3 != 0) {
+        cerr << "Usage: " << argv[0]
+             << " nodeId port minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active"
+             << " [neighborId host port]..." << endl;
+        return 1;
+    }
 
-    int my_port = stoi(argv[2]);
-    Node node(my_id, my_port, peers, false);
+    int my_id          = stoi(argv[1]);
+    int my_port        = stoi(argv[2]);
+    int minPerActive   = stoi(argv[3]);
+    int maxPerActive   = stoi(argv[4]);
+    int minSendDelay   = stoi(argv[5]);
+    int snapShotDelay  = stoi(argv[6]);
+    int maxNumber      = stoi(argv[7]);
+    bool startActive   = stoi(argv[8]) != 0;
 
-    node.wait_for_all_peers();     // blocks until every channel exists
+    vector<PeerInfo> peers;
+    for (int i = FIXED_ARGS; i < argc; i += 3) {
+        peers.push_back({stoi(argv[i]), argv[i + 1], stoi(argv[i + 2])});
+    }
+
+    cout << "Node " << my_id << " on port " << my_port
+         << (startActive ? " (active)" : " (passive)") << ", neighbors:";
+    for (const auto& p : peers) cout << " " << p.id << "@" << p.host << ":" << p.port;
+    cout << endl;
+
+    // Shut the node down automatically 5 minutes after start
+    const auto deadline = chrono::steady_clock::now() + chrono::minutes(5);
+
+    Node node(my_id, my_port, peers, startActive,
+              minPerActive, maxPerActive, minSendDelay, snapShotDelay, maxNumber);
+
+    if (!node.wait_for_all_peers(deadline)) {   // blocks until every channel exists
+        cerr << "Node " << my_id << ": timed out waiting for peers" << endl;
+        return 1;
+    }
+
+    // One file per node, so nodes sharing the network drive don't overwrite each other
+    string statusFile = "node_" + to_string(my_id) + "_connected.txt";
+    ofstream status(statusFile);
+    if (status) {
+        status << "all nodes connected (this is node " << my_id << ")" << endl;
+    } else {
+        cerr << "Node " << my_id << ": can't write " << statusFile << endl;
+    }
 
     // Now send first
     for (const auto& p : peers) {
@@ -297,7 +346,7 @@ int main(int argc, char* argv[]) {
     bool active = false;
     bool running = true;
 
-    while (node.get_running())
+    while (node.get_running() && chrono::steady_clock::now() < deadline)
     {
         if(node.get_state() == true)
         {
@@ -309,10 +358,12 @@ int main(int argc, char* argv[]) {
 
         if (node.get_state() == false) // if it's passive 
         {
-            //sleep
             // nothing is done here ,because only reader threads will change it to active
+            // short sleep so the loop doesn't spin a full CPU core while waiting
+            this_thread::sleep_for(chrono::milliseconds(10));
         }
     }
 
-    return 0;
+    cout << "Node " << my_id << ": time limit reached, shutting down" << endl;
+    return 0;   // Node destructor closes sockets and joins threads
 }
