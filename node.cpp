@@ -35,18 +35,20 @@ enum class MsgType : uint8_t {
 class Node
 {
     public:
-        atomic<int> totalMessagesSent;
+        atomic<int> totalMessagesSent{0};
+        int numberOfNodes;   // total nodes in the system (not used yet)
         int minPerActive;
         int maxPerActive;
         int minSendDelay;
         int snapShotDelay;
         int maxNumber;
         // peers = this node's neighbors only
-        Node(int id, int port, const vector<PeerInfo>& peers, bool active,
+        Node(int id, int port, const vector<PeerInfo>& peers, bool active, int numberOfNodes,
              int minPerActive, int maxPerActive, int minSendDelay, int snapShotDelay, int maxNumber)
-            : id(id), port(port),
+            : numberOfNodes(numberOfNodes),
               minPerActive(minPerActive), maxPerActive(maxPerActive), minSendDelay(minSendDelay),
-              snapShotDelay(snapShotDelay), maxNumber(maxNumber) {
+              snapShotDelay(snapShotDelay), maxNumber(maxNumber),
+              id(id), port(port) {
             // set state
             state.store(active);
 
@@ -277,12 +279,12 @@ class Node
                 int x = ntohl(value);
                 // handle x from peer_id
                 
-                // if passive | and receive message | then we must go active if totalMessagesSent <= maxNUmber
-                if (state == false)
+                // if passive | and receive message | then we must go active if totalMessagesSent < maxNumber
+                if (x == (int)MsgType::MSG && state == false)
                 {
-                    if(totalMessagesSent <= maxNumber)
+                    if (totalMessagesSent < maxNumber && set_state(true))
                     {
-                        set_state(true);
+                        cout << "Node " << id << " <- " << peer_id << ", now active" << endl;
                     }
                 }
                 // if active | do nothing
@@ -336,24 +338,25 @@ string get_output_dir()
 
 
 int main(int argc, char* argv[]) {
-    // args: nodeId port minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active(1/0)
+    // args: nodeId port numberOfNodes minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active(1/0)
     //       followed by one "neighborId host port" triple per neighbor
-    const int FIXED_ARGS = 9;   // program name + 8 values
+    const int FIXED_ARGS = 10;   // program name + 9 values
     if (argc < FIXED_ARGS || (argc - FIXED_ARGS) % 3 != 0) {
         cerr << "Usage: " << argv[0]
-             << " nodeId port minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active"
+             << " nodeId port numberOfNodes minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active"
              << " [neighborId host port]..." << endl;
         return 1;
     }
 
     int my_id          = stoi(argv[1]);
     int my_port        = stoi(argv[2]);
-    int minPerActive   = stoi(argv[3]);
-    int maxPerActive   = stoi(argv[4]);
-    int minSendDelay   = stoi(argv[5]);
-    int snapShotDelay  = stoi(argv[6]);
-    int maxNumber      = stoi(argv[7]);
-    bool startActive   = stoi(argv[8]) != 0;
+    int numberOfNodes  = stoi(argv[3]);
+    int minPerActive   = stoi(argv[4]);
+    int maxPerActive   = stoi(argv[5]);
+    int minSendDelay   = stoi(argv[6]);
+    int snapShotDelay  = stoi(argv[7]);
+    int maxNumber      = stoi(argv[8]);
+    bool startActive   = stoi(argv[9]) != 0;
 
     vector<PeerInfo> peers;
     for (int i = FIXED_ARGS; i < argc; i += 3) {
@@ -368,7 +371,7 @@ int main(int argc, char* argv[]) {
     // Shut the node down automatically 5 minutes after start
     const auto deadline = chrono::steady_clock::now() + chrono::minutes(5);
 
-    Node node(my_id, my_port, peers, startActive,
+    Node node(my_id, my_port, peers, startActive, numberOfNodes,
               minPerActive, maxPerActive, minSendDelay, snapShotDelay, maxNumber);
 
     if (!node.wait_for_all_peers(deadline)) {   // blocks until every channel exists
@@ -385,11 +388,6 @@ int main(int argc, char* argv[]) {
         cerr << "Node " << my_id << ": can't write " << statusFile << endl;
     }
 
-    // Now send first
-    for (const auto& p : peers) {
-        if (p.id != my_id) node.send_to(p.id, 42);
-    }
-
     // Keep main alive while reader threads handle incoming messages
     // e.g. wait for a done condition, or sleep/loop
 
@@ -397,34 +395,30 @@ int main(int argc, char* argv[]) {
     random_device rd;
     mt19937 gen(rd());
     uniform_int_distribution<int> pickMsgNum(node.minPerActive, maxPerActive);
-    uniform_int_distribution<int> pickNodeNum(0, peers.size()); // pick from node0 to node n
+    // index into peers (this node's neighbors), not a node id
+    uniform_int_distribution<int> pickNeighbor(0, (int)peers.size() - 1);
 
-    int totalMsgSent = 0;
     while (node.get_running() && chrono::steady_clock::now() < deadline)
     {
         if(node.get_state() == true)
         {
-            // choose random Node
-            // cnoose Number of Messages 
-            // send message
-            // turn passive
-            
+            // choose number of messages for this active interval, send them, turn passive
             int numToSend = pickMsgNum(gen);
-            
-            // pick random neighbor
-            int peerToSend = pickNodeNum(gen);
-            
-            node.send_to(peerToSend, (int) MsgType::MSG);
-
-            // if we sent more messages than maxNumber
-            if (++node.totalMessagesSent >= maxNumber)
+            for (int i = 0; i < numToSend && !peers.empty()
+                            && node.totalMessagesSent < maxNumber; i++)
             {
-                node.set_state(false);
-            }
+                // only wait between messages, not after the last one
+                if (i > 0) this_thread::sleep_for(chrono::milliseconds(minSendDelay));
 
-            // other wise sleep and remain active
-            this_thread::sleep_for(chrono::milliseconds(minSendDelay));
-            
+                int peerToSend = peers[pickNeighbor(gen)].id;
+                if (node.send_to(peerToSend, (int) MsgType::MSG)) {
+                    int sent = ++node.totalMessagesSent;
+                    cout << "Node " << my_id << " -> " << peerToSend
+                         << " (sent " << sent << "/" << maxNumber << ")" << endl;
+                }
+            }
+            node.set_state(false);
+            cout << "Node " << my_id << ": now passive" << endl;
         }
 
         if (node.get_state() == false) // if it's passive 

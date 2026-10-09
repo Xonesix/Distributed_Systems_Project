@@ -137,12 +137,12 @@ bool read_config_file(string fileName)
 }
 
 // Builds the command run on the remote machine:
-// binary nodeId port minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active [neighborId host port]...
+// binary nodeId port numberOfNodes minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active [neighborId host port]...
 string build_node_command(const PeerInfo& peer, bool active)
 {
     ostringstream cmd;
     cmd << REMOTE_BINARY << " " << peer.getId() << " " << peer.getPort()
-        << " " << minPerActive << " " << maxPerActive << " " << minSendDelay
+        << " " << numberOfNodes << " " << minPerActive << " " << maxPerActive << " " << minSendDelay
         << " " << snapShotDelay << " " << maxNumber << " " << (active ? 1 : 0);
 
     for (int n : neighbors[peer.getId()]) {
