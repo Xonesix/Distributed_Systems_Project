@@ -32,16 +32,23 @@ enum class MsgType : uint8_t {
     FINISH = 3,   // halt broadcast from node 0
 };
 
+// On the wire: [type][count][payload[0]]...[payload[count-1]], every field an int32 in network order
+struct Message {
+    MsgType type;
+    vector<int32_t> payload;
+};
+
 class Node
 {
     public:
         atomic<int> totalMessagesSent{0};
-        int numberOfNodes;   // total nodes in the system (not used yet)
+        int numberOfNodes;   // total nodes in the system (size of the vector clock)
         int minPerActive;
         int maxPerActive;
         int minSendDelay;
         int snapShotDelay;
         int maxNumber;
+
         // peers = this node's neighbors only
         Node(int id, int port, const vector<PeerInfo>& peers, bool active, int numberOfNodes,
              int minPerActive, int maxPerActive, int minSendDelay, int snapShotDelay, int maxNumber)
@@ -51,6 +58,9 @@ class Node
               id(id), port(port) {
             // set state
             state.store(active);
+            
+            // init vector clock
+            vector_clock.assign(numberOfNodes, 0);
 
             // set the amount of expected peers
             for (const auto& p : peers)
@@ -117,16 +127,28 @@ class Node
             }
         }
 
-        bool send_to(int peer_id, int value) {
+        bool send_msg(int peer_id, const Message& m) {
             int fd;
             {
+                // lock to find something in the peers map
                 lock_guard<mutex> lk(peers_mtx);
                 auto it = peer_channels.find(peer_id);
                 if (it == peer_channels.end()) return false;   // not connected
                 fd = it->second;
             }
-            int32_t net = htonl(value);
-            return send_all(fd, &net, sizeof(net));
+
+            // Build the whole message in one buffer: header (type, count) then payload 
+            // buffer: MSG_TYPE SIZE_OF_INTS_TO_COME INT1 INT2 INTi ... INTk
+            vector<int32_t> buf;
+            buf.reserve(2 + m.payload.size());
+            buf.push_back(htonl((int32_t)m.type));
+            buf.push_back(htonl((int32_t)m.payload.size()));
+            
+            for (int32_t v : m.payload) buf.push_back(htonl(v));
+
+            // One send_all under the lock, so messages from different threads never interleave
+            lock_guard<mutex> lk(send_mtx);
+            return send_all(fd, buf.data(), buf.size() * sizeof(int32_t));
         }
 
         // Blocks until every channel exists or the deadline passes. Returns false on timeout.
@@ -154,10 +176,22 @@ class Node
             bool expected = !active;
             return state.compare_exchange_strong(expected, active);
         }
+        // Call right before sending an application message: tick, then hand back a copy to send.
+        // Both happen under the lock so a receive can't change the clock in between.
+        vector<int32_t> tick_for_send()
+        {
+            lock_guard<mutex> lk(clock_mtx);
+            vector_clock[id]++;
+            return vector_clock;   // copy, safe to use after the lock is released
+        }
+
         
 
     private:
         int id, port, listen_fd;
+
+        mutex clock_mtx;
+        vector<int32_t> vector_clock;   // only touch while holding clock_mtx
 
         // Global parameters from the config file (logic to be added later)
         
@@ -168,6 +202,8 @@ class Node
 
         mutex peers_mtx;
         unordered_map<int, int> peer_channels;   // node id -> fd
+
+        mutex send_mtx;   // held for a whole message, see send_msg
 
         condition_variable peers_cv;
         size_t expected_peers = 0;
@@ -194,6 +230,22 @@ class Node
             }
             return true;
     }
+
+        // Reads one whole message: header first, then exactly `count` ints.
+        // Returns false if the connection closed or the header is garbage.
+        static bool recv_msg(int fd, Message& m) {
+            int32_t hdr[2];
+            if (!recv_all(fd, hdr, sizeof(hdr))) return false;
+            m.type = (MsgType)ntohl(hdr[0]);
+            int32_t count = ntohl(hdr[1]);
+            if (count < 0 || count > 10000) return false;   // stream out of sync, drop the connection
+            
+            // Receive the clock
+            m.payload.resize(count);
+            if (count > 0 && !recv_all(fd, m.payload.data(), count * sizeof(int32_t))) return false;
+            for (auto& v : m.payload) v = ntohl(v);
+            return true;
+        }
 
         // Resolve host by name and open a TCP connection (same steps as socket_client.cpp).
         // Returns the connected fd, or -1 if it failed (caller retries).
@@ -273,35 +325,66 @@ class Node
 
         // ONE PER CONNECTED NODE
         void handle_peer(int fd, int peer_id) {
-            int32_t value;
+            Message m;
             while (running) {
-                if (!recv_all(fd, &value, sizeof(value))) break;   // waits for a MESSAGE
-                int x = ntohl(value);
-                // handle x from peer_id
-                
-                // if passive | and receive message | then we must go active if totalMessagesSent < maxNumber
-                if (x == (int)MsgType::MSG && state == false)
-                {
-                    if (totalMessagesSent < maxNumber && set_state(true))
-                    {
-                        cout << "Node " << id << " <- " << peer_id << ", now active" << endl;
+                if (!recv_msg(fd, m)) break;   // waits for a MESSAGE
+
+                switch (m.type) {
+                    case MsgType::MSG: {
+                        // m.payload has the sender's clock, one int per node
+                        if ((int)m.payload.size() != numberOfNodes) {
+                            cerr << "Node " << id << ": bad clock size " << m.payload.size()
+                                 << " from node " << peer_id << endl;
+                            break;
+                        }
+
+                        // Update our own vector clock with the one we have received
+                        {
+                            lock_guard<mutex> lk(clock_mtx);
+                            for (int i = 0; i < numberOfNodes; i++)
+                            {
+                                vector_clock[i] = max(vector_clock[i], m.payload[i]);
+                            }
+                            vector_clock[id]++;
+                        }
+
+                        // if passive | and receive message | then we must go active if totalMessagesSent < maxNumber
+                        if (state == false)
+                        {
+                            if (totalMessagesSent < maxNumber && set_state(true))
+                            {
+                                cout << "Node " << id << " <- " << peer_id << ", now active" << endl;
+                            }
+                        }
+                        // if active | do nothing
+                        break;
                     }
+
+                    case MsgType::MARKER:
+                        // initiate snapshot protocol
+                        break;
+
+                    case MsgType::REPORT:
+                        // forward snapshot data to parent, or collect at node 0
+                        break;
+
+                    case MsgType::FINISH:
+                        // forward to neighbors, then stop
+                        break;
+
+                    default:
+                        cerr << "Node " << id << ": unknown message type " << (int)m.type
+                             << " from node " << peer_id << endl;
+                        break;
                 }
-                // if active | do nothing
-                
-                
-                // Update our own vector clock with the one we have received
-
-                // If its a marker message, initiate snapshot protocol
-
                 // If initiating send, do through main, if replying, do through this thread
-
             }
             unregister_peer(peer_id);
 
             close(fd);
         }
 
+        
         void unregister_peer(int peer_id) {
             lock_guard<mutex> lk(peers_mtx);
             peer_channels.erase(peer_id);
@@ -411,7 +494,8 @@ int main(int argc, char* argv[]) {
                 if (i > 0) this_thread::sleep_for(chrono::milliseconds(minSendDelay));
 
                 int peerToSend = peers[pickNeighbor(gen)].id;
-                if (node.send_to(peerToSend, (int) MsgType::MSG)) {
+                Message msg{MsgType::MSG, node.tick_for_send()};   // payload: vector clock
+                if (node.send_msg(peerToSend, msg)) {
                     int sent = ++node.totalMessagesSent;
                     cout << "Node " << my_id << " -> " << peerToSend
                          << " (sent " << sent << "/" << maxNumber << ")" << endl;
