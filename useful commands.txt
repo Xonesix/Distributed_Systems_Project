@@ -5,3 +5,7 @@ scp main.cpp node.cpp config.txt axj220081@csa-dc02.utdallas.edu:~/socket_projec
 
 Top CPU Users on Machine
 ps -eo pid,user,%cpu,%mem,etime,cmd --sort=-%cpu | head -15
+
+
+Compile on Machine
+/usr/bin/g++ -std=c++17 main.cpp -o main

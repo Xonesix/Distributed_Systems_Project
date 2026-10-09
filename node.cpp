@@ -85,6 +85,7 @@ class Node
                 if (p.id != id) {
                     expected_peers++;
                     neighbor_ids.push_back(p.id);
+                    marker_from[p.id] = false;
                 }
 
 
@@ -292,6 +293,9 @@ class Node
         vector<int> neighbor_ids;
         bool seen_marker_before = false;   // recorded our state for the current snapshot
         size_t markers_received = 0;       // one per incoming channel per snapshot
+        int parent_id = -1;                // who sent our first-ever marker; -1 = none yet (node 0 stays -1)
+        unordered_map<int, bool> marker_from;   // neighbor id -> its marker arrived this snapshot
+        int in_transit = 0;                // MSGs that arrived after we recorded, before that channel's marker
         atomic<int> snapshots_completed{0};
 
         // Caller holds snapshot_mtx. Record our state, then send a marker on every channel.
@@ -305,16 +309,28 @@ class Node
         // Caller holds snapshot_mtx. Done once every incoming channel has delivered its marker.
         void check_snapshot_done_locked() {
             if (markers_received < expected_peers) return; // check if received every marker
+            int k = ++snapshots_completed; // increment snapshots done
+            cout << "Node " << id << ": snapshot " << k << " done, in transit: " << in_transit << endl;
+
+            // reset for the next snapshot
             seen_marker_before = false;
             markers_received = 0;
-            int k = ++snapshots_completed; // increment snapshots done
-            cout << "Node " << id << ": snapshot " << k << " done" << endl;
+            for (auto& [n, got] : marker_from) got = false;
+            in_transit = 0;
         }
 
         // On a marker from peer_id
         void on_marker(int peer_id) {
             lock_guard<mutex> lk(snapshot_mtx);
             markers_received++;   // this channel is done, including the one the first marker came on
+            marker_from[peer_id] = true;   // stop counting MSGs from this channel
+
+            // Parent = sender of the first marker we ever get; never changes after that.
+            // Node 0 is the root, so it never takes a parent.
+            if (parent_id == -1 && id != 0) {
+                parent_id = peer_id;
+                cout << "Node " << id << ": parent is node " << parent_id << endl;
+            }
             if (!seen_marker_before) {
                 cout << "Node " << id << ": first marker from node " << peer_id << ", recording" << endl;
                 begin_snapshot_locked();
@@ -451,6 +467,14 @@ class Node
                                  << " from node " << peer_id << endl;
                             break;
                         }
+
+                        // Whole MSG handled under snapshot_mtx, so a snapshot sees it either
+                        // fully before recording or fully after (counted as in transit)
+                        lock_guard<mutex> snap(snapshot_mtx);
+
+                        // Recorded our state, but this channel's marker hasn't come yet:
+                        // the message was in the channel at snapshot time
+                        if (seen_marker_before && !marker_from[peer_id]) in_transit++;
 
                         // Update our own vector clock with the one we have received
                         {
