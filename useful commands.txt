@@ -1,0 +1,7 @@
+Transfer the files
+
+scp main.cpp node.cpp config.txt axj220081@csa-dc02.utdallas.edu:~/socket_project/
+
+
+Top CPU Users on Machine
+ps -eo pid,user,%cpu,%mem,etime,cmd --sort=-%cpu | head -15

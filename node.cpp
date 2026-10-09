@@ -12,6 +12,9 @@
 #include <atomic>
 #include <condition_variable>
 #include <fstream>
+#include <cerrno>
+#include <cstdlib>
+#include <sys/stat.h>
 using namespace std;
 
 struct PeerInfo {
@@ -283,6 +286,18 @@ class Node
 
 };
 
+// All output files go in ~/socket_project/project_output/ (created if missing).
+// Returns the directory path with a trailing '/'.
+string get_output_dir()
+{
+    const char* home = getenv("HOME");
+    string dir = string(home ? home : ".") + "/socket_project/project_output/";
+    if (mkdir(dir.c_str(), 0755) < 0 && errno != EEXIST) {
+        perror(("mkdir " + dir).c_str());
+    }
+    return dir;
+}
+
 int main(int argc, char* argv[]) {
     // args: nodeId port minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active(1/0)
     //       followed by one "neighborId host port" triple per neighbor
@@ -325,7 +340,7 @@ int main(int argc, char* argv[]) {
     }
 
     // One file per node, so nodes sharing the network drive don't overwrite each other
-    string statusFile = "node_" + to_string(my_id) + "_connected.txt";
+    string statusFile = get_output_dir() + "node_" + to_string(my_id) + "_connected.txt";
     ofstream status(statusFile);
     if (status) {
         status << "all nodes connected (this is node " << my_id << ")" << endl;
