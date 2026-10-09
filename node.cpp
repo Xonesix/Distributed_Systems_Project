@@ -38,6 +38,18 @@ struct Message {
     vector<int32_t> payload;
 };
 
+// All output files go in ~/socket_project/project_output/ (created if missing).
+// Returns the directory path with a trailing '/'.
+string get_output_dir()
+{
+    const char* home = getenv("HOME");
+    string dir = string(home ? home : ".") + "/socket_project/project_output/";
+    if (mkdir(dir.c_str(), 0755) < 0 && errno != EEXIST) {
+        perror(("mkdir " + dir).c_str());
+    }
+    return dir;
+}
+
 class Node
 {
     public:
@@ -62,9 +74,18 @@ class Node
             // init vector clock
             vector_clock.assign(numberOfNodes, 0);
 
+            // Open the output file before any thread starts, so a marker can't arrive first.
+            // One file per node, so nodes sharing the network drive don't overwrite each other
+            output_path = get_output_dir() + "node_" + to_string(id) + "_connected.txt";
+            output_file.open(output_path);
+            if (!output_file) cerr << "Node " << id << ": can't write " << output_path << endl;
+
             // set the amount of expected peers
             for (const auto& p : peers)
-                if (p.id != id) expected_peers++;
+                if (p.id != id) {
+                    expected_peers++;
+                    neighbor_ids.push_back(p.id);
+                }
 
 
             // 1. Create the listening socket
@@ -185,6 +206,58 @@ class Node
             return vector_clock;   // copy, safe to use after the lock is released
         }
 
+        // Sends one application message. Holds snapshot_mtx so it can't land between
+        // a snapshot recording our state and sending its markers.
+        bool send_app_msg(int peer_id)
+        {
+            lock_guard<mutex> lk(snapshot_mtx);
+            Message msg{MsgType::MSG, tick_for_send()};   // payload: vector clock
+            return send_msg(peer_id, msg);
+        }
+
+        // Node 0: start a new snapshot. Returns false if the previous one isn't done here yet.
+        bool start_snapshot()
+        {
+            lock_guard<mutex> lk(snapshot_mtx);
+            if (seen_marker_before) return false;
+            cout << "Node " << id << ": starting snapshot " << snapshots_completed + 1 << endl;
+            begin_snapshot_locked();
+            check_snapshot_done_locked();   // only matters if we have no neighbors
+            return true;
+        }
+
+        int get_snapshots_completed() { return snapshots_completed.load(); }
+
+        bool snapshot_in_progress()
+        {
+            lock_guard<mutex> lk(snapshot_mtx);
+            return seen_marker_before;
+        }
+
+        // Appends one line to this node's output file
+        void write_output(const string& line)
+        {
+            lock_guard<mutex> lk(file_mtx);
+            output_file << line << endl;   // endl flushes, so lines survive the process being killed
+        }
+
+        // Snapshot: append the current vector clock as one line, e.g. "3 0 7 2 1"
+        void record_state()
+        {
+            vector<int32_t> clock_copy;
+            {
+                lock_guard<mutex> lk(clock_mtx);
+                clock_copy = vector_clock;
+            }
+
+            string line;
+            for (size_t i = 0; i < clock_copy.size(); i++) {
+                if (i > 0) line += " ";
+                line += to_string(clock_copy[i]);
+            }
+            write_output(line);
+        }
+
         
 
     private:
@@ -192,6 +265,10 @@ class Node
 
         mutex clock_mtx;
         vector<int32_t> vector_clock;   // only touch while holding clock_mtx
+
+        mutex file_mtx;                 // main and reader threads both write the file
+        string output_path;
+        ofstream output_file;
 
         // Global parameters from the config file (logic to be added later)
         
@@ -207,7 +284,44 @@ class Node
 
         condition_variable peers_cv;
         size_t expected_peers = 0;
-        
+
+        // Chandy Lamport. Everything below is only touched while holding snapshot_mtx.
+        // App sends also hold it (send_app_msg), so no MSG can slip out between
+        // recording our state and sending the markers.
+        mutex snapshot_mtx;
+        vector<int> neighbor_ids;
+        bool seen_marker_before = false;   // recorded our state for the current snapshot
+        size_t markers_received = 0;       // one per incoming channel per snapshot
+        atomic<int> snapshots_completed{0};
+
+        // Caller holds snapshot_mtx. Record our state, then send a marker on every channel.
+        void begin_snapshot_locked() {
+            seen_marker_before = true;
+            record_state();
+            Message marker{MsgType::MARKER, {}};
+            for (int n : neighbor_ids) send_msg(n, marker); // Send marker to every peer
+        }
+
+        // Caller holds snapshot_mtx. Done once every incoming channel has delivered its marker.
+        void check_snapshot_done_locked() {
+            if (markers_received < expected_peers) return; // check if received every marker
+            seen_marker_before = false;
+            markers_received = 0;
+            int k = ++snapshots_completed; // increment snapshots done
+            cout << "Node " << id << ": snapshot " << k << " done" << endl;
+        }
+
+        // On a marker from peer_id
+        void on_marker(int peer_id) {
+            lock_guard<mutex> lk(snapshot_mtx);
+            markers_received++;   // this channel is done, including the one the first marker came on
+            if (!seen_marker_before) {
+                cout << "Node " << id << ": first marker from node " << peer_id << ", recording" << endl;
+                begin_snapshot_locked();
+            }
+            check_snapshot_done_locked();   // checked on every marker, first one included
+        }
+
         
         static bool recv_all(int fd, void* data, size_t len) {
             char* p = (char*)data;
@@ -361,7 +475,8 @@ class Node
                     }
 
                     case MsgType::MARKER:
-                        // initiate snapshot protocol
+                        // first marker: record + forward markers; every marker: count, check if done
+                        on_marker(peer_id);
                         break;
 
                     case MsgType::REPORT:
@@ -406,19 +521,17 @@ class Node
 
 };
 
-// All output files go in ~/socket_project/project_output/ (created if missing).
-// Returns the directory path with a trailing '/'.
-string get_output_dir()
+
+
+// True once at least delayMs milliseconds have passed since lastSnapshot.
+// When it returns true it also resets lastSnapshot to now, so the next snapshot waits a full delay again.
+bool delayHasPassed(chrono::steady_clock::time_point& lastSnapshot, int delayMs)
 {
-    const char* home = getenv("HOME");
-    string dir = string(home ? home : ".") + "/socket_project/project_output/";
-    if (mkdir(dir.c_str(), 0755) < 0 && errno != EEXIST) {
-        perror(("mkdir " + dir).c_str());
-    }
-    return dir;
+    auto now = chrono::steady_clock::now();
+    if (now - lastSnapshot < chrono::milliseconds(delayMs)) return false;
+    lastSnapshot = now;
+    return true;
 }
-
-
 
 int main(int argc, char* argv[]) {
     // args: nodeId port numberOfNodes minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active(1/0)
@@ -462,19 +575,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // One file per node, so nodes sharing the network drive don't overwrite each other
-    string statusFile = get_output_dir() + "node_" + to_string(my_id) + "_connected.txt";
-    ofstream status(statusFile);
-    if (status) {
-        status << "all nodes connected (this is node " << my_id << ")" << endl;
-    } else {
-        cerr << "Node " << my_id << ": can't write " << statusFile << endl;
-    }
+    // First line of the output file; record_state appends one clock line per snapshot after it
+    node.write_output("all nodes connected (this is node " + to_string(my_id) + ")");
 
     // Keep main alive while reader threads handle incoming messages
     // e.g. wait for a done condition, or sleep/loop
 
     
+    // Node 0 starts the first snapshot snapShotDelay ms after everyone is connected
+    auto lastSnapshot = chrono::steady_clock::now();
+    int lastSeenCompleted = 0;
+
     random_device rd;
     mt19937 gen(rd());
     uniform_int_distribution<int> pickMsgNum(node.minPerActive, maxPerActive);
@@ -494,8 +605,7 @@ int main(int argc, char* argv[]) {
                 if (i > 0) this_thread::sleep_for(chrono::milliseconds(minSendDelay));
 
                 int peerToSend = peers[pickNeighbor(gen)].id;
-                Message msg{MsgType::MSG, node.tick_for_send()};   // payload: vector clock
-                if (node.send_msg(peerToSend, msg)) {
+                if (node.send_app_msg(peerToSend)) {
                     int sent = ++node.totalMessagesSent;
                     cout << "Node " << my_id << " -> " << peerToSend
                          << " (sent " << sent << "/" << maxNumber << ")" << endl;
@@ -510,6 +620,20 @@ int main(int argc, char* argv[]) {
             // nothing is done here ,because only reader threads will change it to active
             // short sleep so the loop doesn't spin a full CPU core while waiting
             this_thread::sleep_for(chrono::milliseconds(10));
+        }
+
+        // Initiate snapshot (node 0 only)
+        if (my_id == 0)
+        {
+            // Delay counts from when the previous snapshot finished here, not when it started
+            int done = node.get_snapshots_completed();
+            if (done != lastSeenCompleted) {
+                lastSeenCompleted = done;
+                lastSnapshot = chrono::steady_clock::now();
+            }
+
+            if (!node.snapshot_in_progress() && delayHasPassed(lastSnapshot, snapShotDelay))
+                node.start_snapshot();
         }
     }
 
