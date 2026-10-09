@@ -14,7 +14,9 @@
 #include <fstream>
 #include <cerrno>
 #include <cstdlib>
+#include <cstdio>
 #include <sys/stat.h>
+#include <random>
 using namespace std;
 
 struct PeerInfo {
@@ -23,9 +25,22 @@ struct PeerInfo {
     int port;
 };
 
+enum class MsgType : uint8_t {
+    MARKER = 0,
+    MSG    = 1,
+    REPORT = 2,   // converge-cast snapshot data to parent
+    FINISH = 3,   // halt broadcast from node 0
+};
+
 class Node
 {
     public:
+        atomic<int> totalMessagesSent;
+        int minPerActive;
+        int maxPerActive;
+        int minSendDelay;
+        int snapShotDelay;
+        int maxNumber;
         // peers = this node's neighbors only
         Node(int id, int port, const vector<PeerInfo>& peers, bool active,
              int minPerActive, int maxPerActive, int minSendDelay, int snapShotDelay, int maxNumber)
@@ -132,16 +147,18 @@ class Node
             return s;
         }
 
+        bool set_state(bool active)
+        {
+            bool expected = !active;
+            return state.compare_exchange_strong(expected, active);
+        }
+        
 
     private:
         int id, port, listen_fd;
 
         // Global parameters from the config file (logic to be added later)
-        int minPerActive;
-        int maxPerActive;
-        int minSendDelay;
-        int snapShotDelay;
-        int maxNumber;
+        
         atomic<bool> running{true};
         atomic<bool> state;
         mutex threads_mtx;
@@ -259,6 +276,24 @@ class Node
                 if (!recv_all(fd, &value, sizeof(value))) break;   // waits for a MESSAGE
                 int x = ntohl(value);
                 // handle x from peer_id
+                
+                // if passive | and receive message | then we must go active if totalMessagesSent <= maxNUmber
+                if (state == false)
+                {
+                    if(totalMessagesSent <= maxNumber)
+                    {
+                        set_state(true);
+                    }
+                }
+                // if active | do nothing
+                
+                
+                // Update our own vector clock with the one we have received
+
+                // If its a marker message, initiate snapshot protocol
+
+                // If initiating send, do through main, if replying, do through this thread
+
             }
             unregister_peer(peer_id);
 
@@ -297,6 +332,8 @@ string get_output_dir()
     }
     return dir;
 }
+
+
 
 int main(int argc, char* argv[]) {
     // args: nodeId port minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active(1/0)
@@ -356,11 +393,13 @@ int main(int argc, char* argv[]) {
     // Keep main alive while reader threads handle incoming messages
     // e.g. wait for a done condition, or sleep/loop
 
+    
+    random_device rd;
+    mt19937 gen(rd());
+    uniform_int_distribution<int> pickMsgNum(node.minPerActive, maxPerActive);
+    uniform_int_distribution<int> pickNodeNum(0, peers.size()); // pick from node0 to node n
 
-
-    bool active = false;
-    bool running = true;
-
+    int totalMsgSent = 0;
     while (node.get_running() && chrono::steady_clock::now() < deadline)
     {
         if(node.get_state() == true)
@@ -369,6 +408,23 @@ int main(int argc, char* argv[]) {
             // cnoose Number of Messages 
             // send message
             // turn passive
+            
+            int numToSend = pickMsgNum(gen);
+            
+            // pick random neighbor
+            int peerToSend = pickNodeNum(gen);
+            
+            node.send_to(peerToSend, (int) MsgType::MSG);
+
+            // if we sent more messages than maxNumber
+            if (++node.totalMessagesSent >= maxNumber)
+            {
+                node.set_state(false);
+            }
+
+            // other wise sleep and remain active
+            this_thread::sleep_for(chrono::milliseconds(minSendDelay));
+            
         }
 
         if (node.get_state() == false) // if it's passive 
