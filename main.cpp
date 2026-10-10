@@ -14,9 +14,10 @@
 
 using namespace std;
 
-// Binary is already built on the shared network drive; '~' expands on the remote side
-const string REMOTE_BINARY = "~/socket_project/binary";
-const string SSH_KEY_FILE = "/.ssh/id_rsa";   // relative to $HOME
+// The node binary is built next to main. The dc machines share one network home,
+// so the same absolute path works on every host.
+const string BINARY_NAME = "binary";
+string projectDir;   // absolute path of the directory main is run from
 
 class PeerInfo {
     int id;
@@ -136,12 +137,25 @@ bool read_config_file(string fileName)
     return true;
 }
 
+// Wraps s in single quotes for the remote shell (handles spaces in the path)
+string shell_quote(const string& s)
+{
+    string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    return out + "'";
+}
+
 // Builds the command run on the remote machine:
-// binary nodeId port numberOfNodes minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active [neighborId host port]...
+// cd projectDir && projectDir/binary nodeId port numberOfNodes minPerActive maxPerActive minSendDelay snapShotDelay maxNumber active [neighborId host port]...
+// The node runs in projectDir, so its output files land in projectDir/project_output/
 string build_node_command(const PeerInfo& peer, bool active)
 {
     ostringstream cmd;
-    cmd << REMOTE_BINARY << " " << peer.getId() << " " << peer.getPort()
+    cmd << "cd " << shell_quote(projectDir) << " && exec " << shell_quote(projectDir + "/" + BINARY_NAME)
+        << " " << peer.getId() << " " << peer.getPort()
         << " " << numberOfNodes << " " << minPerActive << " " << maxPerActive << " " << minSendDelay
         << " " << snapShotDelay << " " << maxNumber << " " << (active ? 1 : 0);
 
@@ -153,7 +167,7 @@ string build_node_command(const PeerInfo& peer, bool active)
 }
 
 // Starts "ssh host command" as a child process. Returns its pid, or -1 on failure.
-pid_t launch_over_ssh(const string& host, const string& command, const string& keyPath)
+pid_t launch_over_ssh(const string& host, const string& command)
 {
     pid_t pid = fork();
     if (pid < 0) {
@@ -162,8 +176,9 @@ pid_t launch_over_ssh(const string& host, const string& command, const string& k
     }
     if (pid == 0) {
         // -n: don't read stdin (otherwise all the ssh children fight over the terminal)
+        // No -i: use whatever keys/agent/config the person running this already has
         // BatchMode: fail instead of hanging on a password prompt if the key doesn't work
-        execlp("ssh", "ssh", "-n", "-i", keyPath.c_str(),
+        execlp("ssh", "ssh", "-n",
                "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
                host.c_str(), command.c_str(), (char*)nullptr);
         perror("execlp ssh");   // only reached if exec failed
@@ -176,7 +191,7 @@ pid_t launch_over_ssh(const string& host, const string& command, const string& k
 int main(int argc, char* argv[])
 {
     // read config file
-    string fileName = (argc > 1) ? argv[1] : "config.txt";
+    string fileName = (argc > 1) ? argv[1] : "axj22config.txt";
     bool t = read_config_file(fileName);
     if(!t) {
         cerr << "failure reading" << endl;
@@ -217,21 +232,28 @@ int main(int argc, char* argv[])
     int activeNode = pick(gen);
     cout << "Node " << activeNode << " starts active" << endl << endl;
 
-    const char* home = getenv("HOME");
-    if (!home) {
-        cerr << "HOME is not set, can't find ssh key" << endl;
+    // Run from the project directory; the binary must already be built there
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof(cwd))) {
+        perror("getcwd");
         return 1;
     }
-    string keyPath = string(home) + SSH_KEY_FILE;
+    projectDir = cwd;
+    string binaryPath = projectDir + "/" + BINARY_NAME;
+    if (access(binaryPath.c_str(), X_OK) != 0) {
+        cerr << "can't find " << binaryPath << " (compile node.cpp to '" << BINARY_NAME
+             << "' and run main from the project directory)" << endl;
+        return 1;
+    }
 
-    // ssh into each machine and start its node (binary is already on the network drive)
+    // ssh into each machine and start its node (binary is on the shared network drive)
     vector<pid_t> children;
     for (int i = 0; i < numberOfNodes; i++) {
         const PeerInfo& peer = peers.at(i);
         string command = build_node_command(peer, i == activeNode);
         cout << "Launching on " << peer.getHost() << ": " << command << endl;
 
-        pid_t pid = launch_over_ssh(peer.getHost(), command, keyPath);
+        pid_t pid = launch_over_ssh(peer.getHost(), command);
         if (pid > 0) children.push_back(pid);
     }
 

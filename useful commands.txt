@@ -1,6 +1,6 @@
 Transfer the files
 
-scp main.cpp node.cpp config.txt axj220081@csa-dc02.utdallas.edu:~/socket_project/
+scp main.cpp node.cpp axj22config.txt cleanup.sh axj220081@csa-dc02.utdallas.edu:~/socket_project/
 
 
 Top CPU Users on Machine
@@ -9,3 +9,8 @@ ps -eo pid,user,%cpu,%mem,etime,cmd --sort=-%cpu | head -15
 
 Compile on Machine
 /usr/bin/g++ -std=c++17 main.cpp -o main
+/usr/bin/g++ -std=c++17 node.cpp -o binary
+
+
+Kill Processes
+for h in csa-dc02 csa-dc03 csa-dc04 csa-dc05 csa-dc06; do ssh $h "pkill -u \$USER -f socket_project/binary"; done

@@ -28,22 +28,24 @@ struct PeerInfo {
 enum class MsgType : uint8_t {
     MARKER = 0,
     MSG    = 1,
-    REPORT = 2,   // converge-cast snapshot data to parent
-    FINISH = 3,   // halt broadcast from node 0
+    REPORT = 2,   // converge-cast 
+    FINISH = 3,   
 };
 
-// On the wire: [type][count][payload[0]]...[payload[count-1]], every field an int32 in network order
+//  [type][count][payload[0]]...[payload[count-1]], every field an int32 in network order
 struct Message {
     MsgType type;
     vector<int32_t> payload;
 };
 
-// All output files go in ~/socket_project/project_output/ (created if missing).
+// All output files go in project_output/ 
+// (main starts every node in the project directory). Created if missing.
 // Returns the directory path with a trailing '/'.
 string get_output_dir()
 {
-    const char* home = getenv("HOME");
-    string dir = string(home ? home : ".") + "/socket_project/project_output/";
+    char cwd[4096];
+    string base = getcwd(cwd, sizeof(cwd)) ? string(cwd) : ".";
+    string dir = base + "/project_output/";
     if (mkdir(dir.c_str(), 0755) < 0 && errno != EEXIST) {
         perror(("mkdir " + dir).c_str());
     }
@@ -76,7 +78,7 @@ class Node
 
             // Open the output file before any thread starts, so a marker can't arrive first.
             // One file per node, so nodes sharing the network drive don't overwrite each other
-            output_path = get_output_dir() + "node_" + to_string(id) + "_connected.txt";
+            output_path = get_output_dir() + "axj22config-" + to_string(id) + ".out";
             output_file.open(output_path);
             if (!output_file) cerr << "Node " << id << ": can't write " << output_path << endl;
 
@@ -216,23 +218,34 @@ class Node
             return send_msg(peer_id, msg);
         }
 
-        // Node 0: start a new snapshot. Returns false if the previous one isn't done here yet.
+        // Node 0: start a new snapshot. Returns false if the previous round isn't finished yet.
         bool start_snapshot()
         {
             lock_guard<mutex> lk(snapshot_mtx);
-            if (seen_marker_before) return false;
+            if (seen_marker_before || round_in_progress) return false;
             cout << "Node " << id << ": starting snapshot " << snapshots_completed + 1 << endl;
+
+            // new round: wait for our own snapshot plus a REPORT from every other node
+            round_in_progress = true;
+            own_done = false;
+            reports_received = 0;
+            round_active = 0;
+            round_in_transit = 0;
+
             begin_snapshot_locked();
             check_snapshot_done_locked();   // only matters if we have no neighbors
             return true;
         }
 
-        int get_snapshots_completed() { return snapshots_completed.load(); }
+        // Node 0: rounds where every node's REPORT came in
+        int get_rounds_completed() { return rounds_completed.load(); }
+
+        bool is_map_terminated() { return map_terminated.load(); }
 
         bool snapshot_in_progress()
         {
             lock_guard<mutex> lk(snapshot_mtx);
-            return seen_marker_before;
+            return seen_marker_before || round_in_progress;
         }
 
         // Appends one line to this node's output file
@@ -286,7 +299,7 @@ class Node
         condition_variable peers_cv;
         size_t expected_peers = 0;
 
-        // Chandy Lamport. Everything below is only touched while holding snapshot_mtx.
+        // Chandy Lamport.
         // App sends also hold it (send_app_msg), so no MSG can slip out between
         // recording our state and sending the markers.
         mutex snapshot_mtx;
@@ -296,11 +309,22 @@ class Node
         int parent_id = -1;                // who sent our first-ever marker; -1 = none yet (node 0 stays -1)
         unordered_map<int, bool> marker_from;   // neighbor id -> its marker arrived this snapshot
         int in_transit = 0;                // MSGs that arrived after we recorded, before that channel's marker
+        bool was_active = false;           // active/passive when we recorded, for the REPORT
         atomic<int> snapshots_completed{0};
+
+        // Node 0 only: collecting one REPORT from every other node per snapshot
+        bool round_in_progress = false;
+        bool own_done = false;             // node 0's own snapshot finished
+        int reports_received = 0;
+        int round_active = 0;              // nodes that were active when they recorded
+        int round_in_transit = 0;          // messages in transit, summed over all nodes
+        atomic<int> rounds_completed{0};
+        atomic<bool> map_terminated{false};
 
         // Caller holds snapshot_mtx. Record our state, then send a marker on every channel.
         void begin_snapshot_locked() {
             seen_marker_before = true;
+            was_active = state.load();
             record_state();
             Message marker{MsgType::MARKER, {}};
             for (int n : neighbor_ids) send_msg(n, marker); // Send marker to every peer
@@ -310,13 +334,65 @@ class Node
         void check_snapshot_done_locked() {
             if (markers_received < expected_peers) return; // check if received every marker
             int k = ++snapshots_completed; // increment snapshots done
-            cout << "Node " << id << ": snapshot " << k << " done, in transit: " << in_transit << endl;
+            cout << "Node " << id << ": snapshot " << k << " done, "
+                 << (was_active ? "active" : "passive") << ", in transit: " << in_transit << endl;
+
+            if (id == 0) {
+                // node 0 counts its own state directly
+                own_done = true;
+                add_to_round_locked(was_active, in_transit);
+                check_round_done_locked();
+            } else {
+                // payload: [nodeId, wasActive, inTransit]
+                Message report{MsgType::REPORT, {id, was_active ? 1 : 0, in_transit}};
+                send_msg(parent_id, report);
+            }
 
             // reset for the next snapshot
             seen_marker_before = false;
             markers_received = 0;
             for (auto& [n, got] : marker_from) got = false;
             in_transit = 0;
+        }
+
+        // Node 0, caller holds snapshot_mtx. Adds one node's snapshot state to the current round.
+        void add_to_round_locked(bool active, int transit) {
+            if (active) round_active++;
+            round_in_transit += transit;
+        }
+
+        // Node 0, caller holds snapshot_mtx. Round is over once our own snapshot is done and
+        // every other node has reported. MAP has terminated if everyone was passive and no
+        // message was in transit.
+        void check_round_done_locked() {
+            if (!round_in_progress || !own_done || reports_received < numberOfNodes - 1) return;
+            round_in_progress = false;
+            int k = ++rounds_completed;
+
+            if (round_active == 0 && round_in_transit == 0) {
+                map_terminated = true;
+                cout << "Node " << id << ": snapshot " << k
+                     << ": all nodes passive, no messages in transit -> MAP protocol terminated" << endl;
+            } else {
+                cout << "Node " << id << ": snapshot " << k << ": not terminated ("
+                     << round_active << " active, " << round_in_transit << " in transit)" << endl;
+            }
+        }
+
+        // On a REPORT (from a child, or forwarded up from further down the tree)
+        void on_report(const Message& m) {
+            if (m.payload.size() != 3) {
+                cerr << "Node " << id << ": bad report size " << m.payload.size() << endl;
+                return;
+            }
+            lock_guard<mutex> lk(snapshot_mtx);
+            if (id != 0) {
+                send_msg(parent_id, m);   // pass it up unchanged
+                return;
+            }
+            reports_received++;
+            add_to_round_locked(m.payload[1] != 0, m.payload[2]);
+            check_round_done_locked();
         }
 
         // On a marker from peer_id
@@ -505,6 +581,7 @@ class Node
 
                     case MsgType::REPORT:
                         // forward snapshot data to parent, or collect at node 0
+                        on_report(m);
                         break;
 
                     case MsgType::FINISH:
@@ -518,15 +595,18 @@ class Node
                 }
                 // If initiating send, do through main, if replying, do through this thread
             }
-            unregister_peer(peer_id);
+            unregister_peer(peer_id, fd);
 
             close(fd);
         }
 
         
-        void unregister_peer(int peer_id) {
+        // Only remove the entry if it's still this connection. A stale connection
+        // (e.g. a leftover process from an earlier run) must not remove the live one.
+        void unregister_peer(int peer_id, int fd) {
             lock_guard<mutex> lk(peers_mtx);
-            peer_channels.erase(peer_id);
+            auto it = peer_channels.find(peer_id);
+            if (it != peer_channels.end() && it->second == fd) peer_channels.erase(it);
         }
 
         void register_peer(int peer_id, int fd) {
@@ -599,16 +679,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // First line of the output file; record_state appends one clock line per snapshot after it
-    node.write_output("all nodes connected (this is node " + to_string(my_id) + ")");
-
     // Keep main alive while reader threads handle incoming messages
     // e.g. wait for a done condition, or sleep/loop
 
     
     // Node 0 starts the first snapshot snapShotDelay ms after everyone is connected
     auto lastSnapshot = chrono::steady_clock::now();
-    int lastSeenCompleted = 0;
+    int lastSeenRounds = 0;
 
     random_device rd;
     mt19937 gen(rd());
@@ -646,13 +723,13 @@ int main(int argc, char* argv[]) {
             this_thread::sleep_for(chrono::milliseconds(10));
         }
 
-        // Initiate snapshot (node 0 only)
-        if (my_id == 0)
+        // Initiate snapshot (node 0 only), until one shows MAP has terminated
+        if (my_id == 0 && !node.is_map_terminated())
         {
-            // Delay counts from when the previous snapshot finished here, not when it started
-            int done = node.get_snapshots_completed();
-            if (done != lastSeenCompleted) {
-                lastSeenCompleted = done;
+            // Delay counts from when the previous round finished (every REPORT in), not when it started
+            int rounds = node.get_rounds_completed();
+            if (rounds != lastSeenRounds) {
+                lastSeenRounds = rounds;
                 lastSnapshot = chrono::steady_clock::now();
             }
 
