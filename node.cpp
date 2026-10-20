@@ -320,6 +320,7 @@ class Node
         int round_in_transit = 0;          // messages in transit, summed over all nodes
         atomic<int> rounds_completed{0};
         atomic<bool> map_terminated{false};
+        atomic<bool> finished{false};      // FINISH already forwarded
 
         // Caller holds snapshot_mtx. Record our state, then send a marker on every channel.
         void begin_snapshot_locked() {
@@ -373,6 +374,7 @@ class Node
                 map_terminated = true;
                 cout << "Node " << id << ": snapshot " << k
                      << ": all nodes passive, no messages in transit -> MAP protocol terminated" << endl;
+                on_finish(-1);   // tell everyone to stop (-1: didn't come from a neighbor)
             } else {
                 cout << "Node " << id << ": snapshot " << k << ": not terminated ("
                      << round_active << " active, " << round_in_transit << " in transit)" << endl;
@@ -393,6 +395,17 @@ class Node
             reports_received++;
             add_to_round_locked(m.payload[1] != 0, m.payload[2]);
             check_round_done_locked();
+        }
+
+        // On FINISH from peer_id (or node 0 detecting termination, peer_id = -1).
+        // Forward it to every other neighbor once, then stop this node.
+        void on_finish(int peer_id) {
+            if (finished.exchange(true)) return;   // already forwarded it, ignore duplicates
+            cout << "Node " << id << ": finishing, forwarding FINISH to neighbors" << endl;
+            Message fin{MsgType::FINISH, {}};
+            for (int n : neighbor_ids)
+                if (n != peer_id) send_msg(n, fin);
+            running = false;   // main loop sees this and exits
         }
 
         // On a marker from peer_id
@@ -429,7 +442,9 @@ class Node
         static bool send_all(int fd, const void* data, size_t len) {
             const char* p = (const char*)data;
             while (len > 0) {
-                ssize_t n = send(fd, p, len, 0);
+                // MSG_NOSIGNAL: if the peer already closed (e.g. it finished first),
+                // return an error instead of a SIGPIPE killing this process
+                ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
                 if (n <= 0) return false;
                 p += n;
                 len -= n;
@@ -586,6 +601,7 @@ class Node
 
                     case MsgType::FINISH:
                         // forward to neighbors, then stop
+                        on_finish(peer_id);
                         break;
 
                     default:
@@ -668,8 +684,8 @@ int main(int argc, char* argv[]) {
     for (const auto& p : peers) cout << " " << p.id << "@" << p.host << ":" << p.port;
     cout << endl;
 
-    // Shut the node down automatically 5 minutes after start
-    const auto deadline = chrono::steady_clock::now() + chrono::minutes(5);
+    // Backup in case FINISH never arrives: shut the node down 20 minutes after start
+    const auto deadline = chrono::steady_clock::now() + chrono::minutes(20);
 
     Node node(my_id, my_port, peers, startActive, numberOfNodes,
               minPerActive, maxPerActive, minSendDelay, snapShotDelay, maxNumber);
@@ -738,6 +754,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    cout << "Node " << my_id << ": time limit reached, shutting down" << endl;
+    if (node.get_running())
+        cout << "Node " << my_id << ": time limit reached, shutting down" << endl;
+    else
+        cout << "Node " << my_id << ": FINISH done, shutting down" << endl;
     return 0;   // Node destructor closes sockets and joins threads
 }
